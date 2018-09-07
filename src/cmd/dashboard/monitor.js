@@ -1,14 +1,13 @@
 let blessed = require("neo-blessed");
-let CommandHistory = require('./command_history.js');
+const REPL = require('./repl.js');
+const stream = require('stream');
 
 class Monitor {
   constructor(_options) {
     let options = _options || {};
     this.env = options.env;
     this.console = options.console;
-    this.history = new CommandHistory();
     this.events = options.events;
-
     this.color = options.color || "green";
     this.minimal = options.minimal || false;
 
@@ -23,7 +22,7 @@ class Monitor {
     this.layoutLog();
     this.layoutStatus();
     this.layoutModules();
-    this.layoutCmd();
+    this.layoutTerminal();
 
     this.screen.key(["C-c"], function () {
       process.exit(0);
@@ -36,7 +35,64 @@ class Monitor {
     this.status.setContent(this.env.green);
 
     this.screen.render();
-    this.input.focus();
+
+    this.terminalReadableStream = new stream.Readable({
+      read() {}
+    });
+
+    const logText = this.logText;
+    const terminal = this.terminal;
+    const terminalWritableStream = new stream.Writable({
+      write(chunk, encoding, next) {
+        // const terminalPrompt = "Embark (" + this.env + ") > ";
+        // const chunkString = chunk.toString();
+
+        // if (chunkString.contains(terminalPrompt)) {
+        //     // terminal.write()
+        // }
+        // else {
+
+        // }
+
+        // const regex = new RegExp(`(.*)(${terminalPrompt})`);
+        // const groups = regex.exec(chunkString);
+
+        // if (groups === null) {
+        //   terminal.write(chunk.toString());
+        // }
+        // else {
+        //   logText.log(groups[1]);
+        //   terminal.write(groups[2]);
+        // }
+
+        terminal.write(chunk.toString());
+
+        next();
+      }
+    });
+
+    // process.stderr.on('data', (data) => {
+    //   this.logText.log(data.toString());
+    //   // process.exit(0);
+    // });
+
+    // process.stderr.on('data', (data) => {
+    //   require('fs').writeFileSync('temp-repl-output', 'monkey-12345');
+    // });
+
+    // setTimeout(() => {
+    //   console.error('monkey')
+    // }, 5000);
+
+    const repl = new REPL({
+      events: this.events,
+      env: this.env,
+      inputStream: this.terminalReadableStream,
+      outputStream: terminalWritableStream,
+      logText: this.logText
+    }).start(() => {
+      this.terminal.focus();
+    });
   }
 
   availableServices(_services) {
@@ -89,7 +145,7 @@ class Monitor {
       width: "100%",
       height: "55%",
       left: "0%",
-      top: "42%",
+      top: "40%",
       border: {
         type: "line"
       },
@@ -127,7 +183,7 @@ class Monitor {
       tags: true,
       padding: 1,
       width: "75%",
-      height: "42%",
+      height: "40%",
       left: "0%",
       top: "0",
       border: {
@@ -287,97 +343,41 @@ class Monitor {
     this.screen.append(this.wrapper);
   }
 
-  layoutCmd() {
-    this.consoleBox = blessed.box({
-      label: __('Console'),
-      tags: true,
-      padding: 0,
-      width: '100%',
-      height: '6%',
-      left: '0%',
-      top: '95%',
-      border: {
-        type: 'line'
-      },
-      style: {
-        fg: 'black',
-        border: {
-          fg: this.color
+  layoutTerminal() {
+      this.terminal = blessed.terminal({
+        parent: this.screen,
+        cursor: 'block',
+        cursorBlink: true,
+        padding: 0,
+        width: '100%',
+        height: 3,
+        left: 0,
+        top: '100%-3',
+        border: 'line',
+        style: {
+            fg: 'default',
+            bg: 'default',
+            focus: {
+                border: {
+                    fg: 'green'
+                }
+            }
+        },
+        scrollable: false,
+        handler: (data) => {
+          this.terminalReadableStream.push(data);
         }
-      }
-    });
+      });
 
-    this.input = blessed.textbox({
-      parent: this.consoleBox,
-      name: 'input',
-      input: true,
-      keys: false,
-      top: 0,
-      left: 1,
-      height: '50%',
-      width: '100%-2',
-      inputOnFocus: true,
-      style: {
-        fg: 'green',
-        bg: 'black',
-        focus: {
-          bg: 'black',
-          fg: 'green'
-        }
-      }
-    });
+      this.terminal.key('C-c', () => {
+        this.terminal.kill();
+        return screen.destroy();
+      });
 
-    let self = this;
-
-    this.input.key(["C-c"], function () {
-      self.events.emit('exit');
-      process.exit(0);
-    });
-
-    this.input.key(["C-w"], function () {
-      self.input.clearValue();
-      self.input.focus();
-    });
-
-    this.input.key(["up"], function () {
-      let cmd = self.history.getPreviousCommand();
-      self.input.setValue(cmd);
-      self.input.focus();
-    });
-
-    this.input.key(["down"], function () {
-      let cmd = self.history.getNextCommand();
-      self.input.setValue(cmd);
-      self.input.focus();
-    });
-
-    this.input.on('submit', this.submitCmd.bind(this));
-
-    this.screen.append(this.consoleBox);
+      this.terminal.on('click', () => {
+        this.terminal.focus();
+      });
   }
-
-  submitCmd(cmd) {
-    if (cmd !== '') {
-      this.history.addCommand(cmd);
-      this.executeCmd(cmd);
-    }
-    this.input.clearValue();
-    this.input.focus();
-  }
-
-  executeCmd(cmd, cb) {
-    this.logText.log('console> '.bold.green + cmd);
-    this.events.request('console:executeCmd', cmd, (err, result) => {
-      let message = err || result;
-      if (message) {
-        this.logText.log(message);
-      }
-      if (cb) {
-        cb(message);
-      }
-    });
-  }
-
 }
 
 module.exports = Monitor;
