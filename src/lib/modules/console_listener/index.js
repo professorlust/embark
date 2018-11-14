@@ -1,4 +1,3 @@
-const async = require('async');
 const utils = require('../../utils/utils.js');
 const fs = require('../../core/fs');
 
@@ -13,10 +12,16 @@ class ConsoleListener {
     this.contractsDeployed = false;
     this.outputDone = false;
     this.logFile = fs.dappPath(".embark", "contractLogs.json");
+    fs.ensureFileSync(this.logFile);
+    this.logFileDraining = true;
+    this.logFileQueue = [];
+    this.logFileReading = 0;
+    this.logFileWriting = false;
+    this.logFileWriteStream = require('fs').createWriteStream(this.logFile);
 
     this._listenForLogRequests();
     this._registerAPI();
-    
+
     this.events.on("contracts:log", this._saveLog.bind(this));
     this.events.on('outputDone', () => {
       this.outputDone = true;
@@ -24,21 +29,6 @@ class ConsoleListener {
     this.events.on("contractsDeployed", () => {
       this.contractsDeployed = true;
       this._updateContractList();
-    });
-
-    this.writeLogFile = async.cargo((tasks, callback) => {
-      const data = this._readLogs();
-
-      tasks.forEach(task => {
-        data[new Date().getTime()] = task;
-      });
-
-      fs.writeJson(this.logFile, data, err => {
-        if (err) {
-          console.error(err);
-        }
-        callback();
-      });
     });
   }
 
@@ -139,27 +129,57 @@ class ConsoleListener {
     this.embark.registerAPICall(
       'get',
       apiRoute,
-      (req, res) => {
-        res.send(JSON.stringify(this._getLogs()));
+      async (req, res) => {
+        res.send(JSON.stringify(await this._getLogs()));
       }
     );
   }
 
-  _getLogs() {
-    const data = this._readLogs();
-    return Object.values(data).reverse();
+  async _getLogs() {
+    return (await this._readLogs()).reverse();
   }
 
-  _saveLog(log) {
-    this.writeLogFile.push(log);
+  async _saveLog(log) {
+    const logs = this.logFileQueue;
+    if (log) logs.push(log);
+    if (!this.logFileDraining ||
+        this.logFileReading ||
+        this.logFileWriting ||
+        !logs.length) {
+      return;
+    }
+    this.logFileWriting = true;
+    const delim = ',\n';
+    const str = logs.map(l => JSON.stringify(l)).join(delim) + delim;
+    logs.length = 0;
+    this.logFileDraining = this.logFileWriteStream.write(str, () => {
+      this.logFileWriting = false;
+      if (logs.length && this.logFileDraining) {
+        setImmediate(this._saveLog.bind(this));
+      }
+    });
+    if (!this.logFileDraining) {
+      this.logFileWriteStream.once('drain', () => {
+        this.logFileDraining = true;
+        if (logs.length) {
+          setImmediate(this._saveLog.bind(this));
+        }
+      });
+    }
   }
 
-  _readLogs() {
-    fs.ensureFileSync(this.logFile);
+  async _readLogs() {
+    while (this.logFileWriting) {
+      // eslint-disable-next-line no-await-in-loop
+      await utils.timer(1);
+    }
+    this.logFileReading++;
     try {
-      return JSON.parse(fs.readFileSync(this.logFile));
-    } catch(_error) {
-      return {};
+      return JSON.parse(`[${(await fs.readFile(this.logFile)).slice(0, -2)}]`);
+    } catch (_error) {
+      return [];
+    } finally {
+      this.logFileReading--;
     }
   }
 }
