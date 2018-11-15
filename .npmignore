@@ -16,3 +16,4 @@ src
 test_apps
 tsconfig.json
 tslint.json
+yarn.lock
