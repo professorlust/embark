@@ -83,22 +83,33 @@ class SpecialConfigs {
     const self = this;
 
     this.embark.registerActionForEvent("contracts:deploy:afterAll", (cb) => {
-      let afterDeployCmds = self.config.contractsConfig.afterDeploy || [];
-      async.mapLimit(afterDeployCmds, 1, (cmd, nextMapCb) => {
-        async.waterfall([
-          function replaceWithAddresses(next) {
-            self.replaceWithAddresses(cmd, next);
-          },
-          self.replaceWithENSAddress.bind(self)
-        ], nextMapCb);
-      }, (err, onDeployCode) => {
-        if (err) {
-          self.logger.trace(err);
-          return cb(new Error("error running afterDeploy"));
-        }
+      if (typeof self.config.contractsConfig.afterDeploy === 'function') {
+        this.getAfterDeployLifecycleHookDependencies().then(dependencies => {
+          (async () => {
+            await self.config.contractsConfig.afterDeploy(dependencies);
+            cb();
+          })();
+        }, err => {
+          return cb(new Error(`Error registering afterDeploy lifecycle hook: ${err.message}`));
+        });
+      } else {
+        let afterDeployCmds = self.config.contractsConfig.afterDeploy || [];
+        async.mapLimit(afterDeployCmds, 1, (cmd, nextMapCb) => {
+          async.waterfall([
+            function replaceWithAddresses(next) {
+              self.replaceWithAddresses(cmd, next);
+            },
+            self.replaceWithENSAddress.bind(self)
+          ], nextMapCb);
+        }, (err, onDeployCode) => {
+          if (err) {
+            self.logger.trace(err);
+            return cb(new Error("error running afterDeploy"));
+          }
 
-        self.runOnDeployCode(onDeployCode, cb);
-      });
+          self.runOnDeployCode(onDeployCode, cb);
+        });
+      }
     });
   }
 
@@ -133,27 +144,39 @@ class SpecialConfigs {
         self.logger.info(__('executing onDeploy commands'));
       }
 
-      let onDeployCmds = contract.onDeploy;
-      async.mapLimit(onDeployCmds, 1, (cmd, nextMapCb) => {
-        async.waterfall([
-          function replaceWithAddresses(next) {
-            self.replaceWithAddresses(cmd, next);
-          },
-          self.replaceWithENSAddress.bind(self)
-        ], (err, code) => {
-          if (err) {
-            self.logger.error(err.message || err);
-            return nextMapCb(); // Don't return error as we just skip the failing command
-          }
-          nextMapCb(null, code);
+      if (typeof contract.onDeploy === 'function') {
+        this.getOnDeployLifecycleHookDependencies(contract).then(dependencies => {
+          (async() => {
+            await contract.onDeploy(dependencies);
+            cb();
+          })();
+        }, err => {
+          return cb(new Error(`Error when registering onDeploy hook for ${contract.name}: ${err.message}`));
         });
-      }, (err, onDeployCode) => {
-        if (err) {
-          return cb(new Error("error running onDeploy for " + contract.className.cyan));
-        }
+      } else {
 
-        self.runOnDeployCode(onDeployCode, cb, contract.silent);
-      });
+        let onDeployCmds = contract.onDeploy;
+        async.mapLimit(onDeployCmds, 1, (cmd, nextMapCb) => {
+          async.waterfall([
+            function replaceWithAddresses(next) {
+              self.replaceWithAddresses(cmd, next);
+            },
+            self.replaceWithENSAddress.bind(self)
+          ], (err, code) => {
+            if (err) {
+              self.logger.error(err.message || err);
+              return nextMapCb(); // Don't return error as we just skip the failing command
+            }
+            nextMapCb(null, code);
+          });
+        }, (err, onDeployCode) => {
+          if (err) {
+            return cb(new Error("error running onDeploy for " + contract.className.cyan));
+          }
+
+          self.runOnDeployCode(onDeployCode, cb, contract.silent);
+        });
+      }
     });
   }
 
@@ -162,25 +185,101 @@ class SpecialConfigs {
 
     self.embark.registerActionForEvent("deploy:contract:shouldDeploy", (params, cb) => {
       let cmd = params.contract.deployIf;
+      const contract = params.contract;
       if (!cmd) {
         return cb(params);
       }
 
-      self.events.request('runcode:eval', cmd, (err, result) => {
-        if (err) {
-          self.logger.error(params.contract.className + ' deployIf directive has an error; contract will not deploy');
-          self.logger.error(err);
-          params.shouldDeploy = false;
-        } else if (!result) {
-          self.logger.info(params.contract.className + ' deployIf directive returned false; contract will not deploy');
-          params.shouldDeploy = false;
-        }
+      if (typeof cmd === 'function') {
+        this.getOnDeployLifecycleHookDependencies(contract).then(dependencies => {
+          const callbackFn = (value) => {
+          };
+          (async () => {
+            params.shouldDeploy = await contract.deployIf(dependencies);
+            cb(params);
+          })();
+        }, err => {
+          return cb(new Error(`Error when registering deployIf hook for ${contract.name}: ${err.message}`));
+        });
+      } else {
 
-        cb(params);
+        self.events.request('runcode:eval', cmd, (err, result) => {
+          if (err) {
+            self.logger.error(params.contract.className + ' deployIf directive has an error; contract will not deploy');
+            self.logger.error(err);
+            params.shouldDeploy = false;
+          } else if (!result) {
+            self.logger.info(params.contract.className + ' deployIf directive returned false; contract will not deploy');
+            params.shouldDeploy = false;
+          }
+
+          cb(params);
+        });
+      }
+    });
+  }
+
+  getOnDeployLifecycleHookDependencies(contractConfig) {
+    let dependencyNames = contractConfig.deps || [];
+    dependencyNames.push(contractConfig.className);
+
+    return new Promise((resolve, reject) => {
+      async.map(dependencyNames, (contractName, next) => {
+        this.events.request('contracts:contract', contractName, (contractRecipe) => {
+          if (!contractRecipe) {
+            next(new Error('ReferredContractDoesNotExist'));
+          }
+          this.events.request('blockchain:contract:create', {
+            abi: contractRecipe.abiDefinition,
+            address: contractRecipe.deployedAddress
+          }, contractInstance => {
+            next(null, { className: contractRecipe.className, instance: contractInstance });
+          });
+        });
+      }, (err, contractInstances) => {
+        if (err) {
+          reject(err);
+        }
+        this.events.request('blockchain:get', web3 => {
+
+          let dependencies = { contracts: {}, web3 };
+
+          contractInstances.forEach(contractInstance => {
+            dependencies.contracts[contractInstance.className] = contractInstance.instance;
+          });
+          resolve(dependencies);
+        });
       });
     });
   }
 
+  getAfterDeployLifecycleHookDependencies() {
+    return new Promise((resolve, reject) => {
+      this.events.request('contracts:list', (err, contracts) => {
+        async.map(contracts, (contract, next) => {
+          this.events.request('blockchain:contract:create', {
+            abi: contract.abiDefinition,
+            address: contract.deployedAddress
+          }, contractInstance => {
+            next(null, { className: contract.className, instance: contractInstance });
+          });
+        }, (err, contractInstances) => {
+          if (err) {
+            reject(err);
+          }
+          this.events.request('blockchain:get', web3 => {
+
+            let dependencies = { contracts: {}, web3 };
+
+            contractInstances.forEach(contractInstance => {
+              dependencies.contracts[contractInstance.className] = contractInstance.instance;
+            });
+            resolve(dependencies);
+          });
+        });
+      });
+    });
+  }
 }
 
 module.exports = SpecialConfigs;
